@@ -326,12 +326,22 @@ end
 local function handle_nip11(conn, _)
     log.info('Handling NIP-11 (Relay Information Document) request.')
     local relay_info = {
-        name = 'Lua Nostr Relay',
-        description = 'A simple Nostr relay powered by Copas/LuaSocket.',
-        supported_nips = {1, 9, 11},
+        name = os.getenv('RELAY_NAME') or 'Lua Nostr Relay',
+        description = os.getenv('RELAY_DESCRIPTION') or 'A simple Nostr relay powered by Copas/LuaSocket.',
+        pubkey = os.getenv('RELAY_PUBKEY') or '',
+        contact = os.getenv('RELAY_CONTACT') or '',
+        supported_nips = {1, 2, 4, 9, 11, 12, 15, 16, 20, 22, 28, 33, 40},
         software = 'lua-nostr-relay',
         version = '0.0.1'
     }
+    local relay_url = os.getenv('RELAY_URL')
+    if relay_url and relay_url ~= '' then
+        relay_info['url'] = relay_url
+    end
+    local relay_icon = os.getenv('RELAY_ICON')
+    if relay_icon and relay_icon ~= '' then
+        relay_info['icon'] = relay_icon
+    end
     local body = cjson.encode(relay_info)
     write_http_response(conn, '200 OK', 'application/nostr+json', body)
 end
