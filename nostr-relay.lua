@@ -5,6 +5,7 @@ local cjson = require 'cjson'
 local pgsql = require 'pgsql'
 local handshake = require 'websocket.handshake'
 local sync = require 'websocket.sync'
+local schnorr = require 'nostr_schnorr'
 local log = require 'log'
 
 log.usecolor = false
@@ -249,6 +250,11 @@ local function handle_websocket(ws)
         ------------------------------------------------------------
         if kind == 'EVENT' then
             local ev = payload[2]
+
+            if not schnorr.verify(ev['sig'], ev['id'], ev['pubkey']) then
+                log.error(string.format('Invalid event signature %s', ev['sig']))
+                goto continue
+            end
 
             local result = con:execParams([[
                 INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig)

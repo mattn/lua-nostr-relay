@@ -21,7 +21,8 @@ RUN luarocks install copas \
  && luarocks install lua-cjson \
  && luarocks install luapgsql PQ_INCDIR=/usr/include/postgresql \
  && luarocks install lua-websockets \
- && luarocks install log.lua
+ && luarocks install log.lua \
+ && luarocks install https://raw.githubusercontent.com/mattn/lua-nostr-schnorr/refs/heads/main/nostr-schnorr-0.0.1-1.rockspec
 
 FROM alpine:3.20
 
