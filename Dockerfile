@@ -31,7 +31,7 @@ ARG LUA_VER=5.2
 ENV LUA_EXE=lua${LUA_VER}
 ENV DATABASE_URL=
 
-RUN apk add --no-cache lua${LUA_VER} libpq
+RUN apk add --no-cache lua${LUA_VER} libpq libsecp256k1
 
 COPY --from=builder /usr/local /usr/local
 
