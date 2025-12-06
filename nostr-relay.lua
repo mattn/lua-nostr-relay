@@ -253,6 +253,7 @@ local function handle_websocket(ws)
 
             if not schnorr.verify(ev['sig'], ev['id'], ev['pubkey']) then
                 log.error(string.format('Invalid event signature %s', ev['sig']))
+                ws:send(cjson.encode({'NOTICE', 'Invalid event signature'}))
                 goto continue
             end
 
