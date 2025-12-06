@@ -6,7 +6,8 @@ ARG LUAROCKS_VER=3.12.2
 RUN apk add --no-cache \
     lua${LUA_VER} lua${LUA_VER}-dev \
     luajit gcc musl-dev postgresql-dev \
-    git make curl tar wget ca-certificates
+    libsecp256k1-dev \
+    git make tar wget ca-certificates
 
 RUN set -ex; \
     wget https://github.com/luarocks/luarocks/archive/v${LUAROCKS_VER}.tar.gz && \
