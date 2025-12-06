@@ -188,6 +188,10 @@ end
 ----------------------------------------------------------------
 -- Event type classification
 ----------------------------------------------------------------
+local function is_deletion(kind)
+    return kind == 5
+end
+
 local function is_ephemeral(kind)
     return kind >= 20000 and kind < 30000
 end
@@ -214,6 +218,10 @@ end
 ----------------------------------------------------------------
 local function handle_replaceable_event(event)
     local kind = tonumber(event['kind'])
+
+    if is_deletion(kind) then
+        return true -- Don't store deletion events
+    end
 
     if is_ephemeral(kind) then
         return true -- Don't store ephemeral events
