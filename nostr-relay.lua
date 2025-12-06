@@ -306,6 +306,17 @@ local function handle_websocket(ws)
             end
 
             local kind = tonumber(ev['kind'])
+            if kind == 5 then
+                -- Handle deletion event (kind 5)
+                for _, tag in ipairs(ev['tags']) do
+                    if tag[1] == 'e' and tag[2] then
+                        con:execParams([[
+                            DELETE FROM event WHERE id = $1 AND pubkey = $2
+                        ]], tag[2], ev['pubkey'])
+                    end
+                end
+            end
+
             local skip_storage = handle_replaceable_event(ev)
 
             local result = true
