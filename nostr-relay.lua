@@ -88,7 +88,7 @@ local function to_json(value)
                     end
                 end
             end
- 
+
             local parts = {}
             if is_array then
                 for i=1,max_idx do
@@ -186,6 +186,54 @@ local function build_filter_query(filters)
 end
 
 ----------------------------------------------------------------
+-- Event type classification
+----------------------------------------------------------------
+local function is_ephemeral(kind)
+    return kind >= 20000 and kind < 30000
+end
+
+local function is_replaceable(kind)
+    return kind == 0 or kind == 3 or (kind >= 10000 and kind < 20000)
+end
+
+local function is_parameterized_replaceable(kind)
+    return kind >= 30000 and kind < 40000
+end
+
+local function get_d_tag(tags)
+    for _, tag in ipairs(tags) do
+        if tag[1] == 'd' and tag[2] then
+            return tag[2]
+        end
+    end
+    return ''
+end
+
+----------------------------------------------------------------
+-- Handle replaceable events
+----------------------------------------------------------------
+local function handle_replaceable_event(event)
+    local kind = tonumber(event['kind'])
+
+    if is_ephemeral(kind) then
+        return true -- Don't store ephemeral events
+    end
+
+    if is_replaceable(kind) then
+        con:execParams([[
+            DELETE FROM event WHERE pubkey = $1 AND kind = $2
+        ]], event['pubkey'], event['kind'])
+    elseif is_parameterized_replaceable(kind) then
+        local d_tag = get_d_tag(event['tags'])
+        con:execParams([[
+            DELETE FROM event WHERE pubkey = $1 AND kind = $2 AND tags @> $3
+        ]], event['pubkey'], event['kind'], to_json({{'d', d_tag}}))
+    end
+
+    return false -- Store the event
+end
+
+----------------------------------------------------------------
 -- Broadcast EVENT to all subscribers that match filters
 ----------------------------------------------------------------
 local function broadcast_event(event)
@@ -243,12 +291,12 @@ local function handle_websocket(ws)
             goto continue 
         end
 
-        local kind = payload[1]
+        local method = payload[1]
 
         ------------------------------------------------------------
         -- EVENT
         ------------------------------------------------------------
-        if kind == 'EVENT' then
+        if method == 'EVENT' then
             local ev = payload[2]
 
             if not schnorr.verify(ev['sig'], ev['id'], ev['pubkey']) then
@@ -257,14 +305,20 @@ local function handle_websocket(ws)
                 goto continue
             end
 
-            local result = con:execParams([[
-                INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig)
-                VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7)
-                ON CONFLICT (id) DO NOTHING
-            ]],
-                ev['id'], ev['pubkey'], ev['created_at'], ev['kind'],
-                to_json(ev['tags']), ev['content'], ev['sig']
-            )
+            local kind = tonumber(ev['kind'])
+            local skip_storage = handle_replaceable_event(ev)
+
+            local result = true
+            if not skip_storage then
+                result = con:execParams([[
+                    INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig)
+                    VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7)
+                    ON CONFLICT (id) DO NOTHING
+                ]],
+                    ev['id'], ev['pubkey'], ev['created_at'], ev['kind'],
+                    to_json(ev['tags']), ev['content'], ev['sig']
+                )
+            end
 
             if result then
                 ws:send(cjson.encode({'OK', ev['id'], true, ''}))
@@ -277,10 +331,10 @@ local function handle_websocket(ws)
         ------------------------------------------------------------
         -- REQ
         ------------------------------------------------------------
-        elseif kind == 'REQ' then
+        elseif method == 'REQ' then
             local sub_id = payload[2]
             local filters = payload[3]
-            
+
             subscribers[ws][sub_id] = { ['filters'] = filters }
 
             local sql, params = build_filter_query(filters)
@@ -291,7 +345,7 @@ local function handle_websocket(ws)
                 ws:send(cjson.encode({'CLOSED', sub_id, 'Failed  to query records'}))
                 goto continue
             end
-            
+
             for tuple,_ in res:tuples() do
                 ws:send(to_json({'EVENT', sub_id, {
                     ['id'] = tuple.id,
@@ -309,7 +363,7 @@ local function handle_websocket(ws)
         ------------------------------------------------------------
         -- CLOSE
         ------------------------------------------------------------
-        elseif kind == 'CLOSE' then
+        elseif method == 'CLOSE' then
             local sub_id = payload[2]
             if subscribers[ws] then
                 subscribers[ws][sub_id] = nil
@@ -448,7 +502,7 @@ end
 local function handle_connection(sock)
     local peer_name = tostring(sock:getpeername())
     log.info(string.format('New incoming connection from %s', peer_name))
-    
+
     local conn = copas.wrap(sock)
     local headers, request_line = read_headers(conn)
     if not headers then
