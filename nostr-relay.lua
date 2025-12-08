@@ -318,9 +318,29 @@ local function handle_websocket(ws)
                 -- Handle deletion event (kind 5)
                 for _, tag in ipairs(ev['tags']) do
                     if tag[1] == 'e' and tag[2] then
-                        con:execParams([[
-                            DELETE FROM event WHERE id = $1 AND pubkey = $2
-                        ]], tag[2], ev['pubkey'])
+                        local res = con:execParams([[
+                            SELECT kind, pubkey, tags FROM event WHERE id = $1
+                        ]], tag[2])
+                        if not res then
+                            log.error('Failed to delete event')
+                            ws:send(cjson.encode({'OK', ev['id'], false, 'Failed  to delete event'}))
+                            goto continue
+                        end
+                        if tonumber(res[1].kind) == 1059 then
+                            local tags = cjson.decode(res[1].tags)
+                            if not (tags and tags[1] and tags[1][1] == "p" and tags[1][2] == ev['pubkey']) then
+                                log.error('Failed to delete event')
+                                ws:send(cjson.encode({'OK', ev['id'], false, 'Failed  to delete event'}))
+                                goto continue
+                            end
+                            con:execParams([[
+                                DELETE FROM event WHERE id = $1
+                            ]], tag[2])
+                        else
+                            con:execParams([[
+                                DELETE FROM event WHERE id = $1 AND pubkey = $2
+                            ]], tag[2], ev['pubkey'])
+                        end
                     end
                 end
             end
