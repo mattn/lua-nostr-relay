@@ -413,9 +413,11 @@ local function handle_websocket(ws)
     end
 end
 
-local function write_http_response(conn, status, content_type, body)
+local function write_http_response(conn, status, headers, body)
     local response = 'HTTP/1.1 ' .. status .. '\r\n'
-    response = response .. 'Content-Type: ' .. content_type .. '\r\n'
+    for k, v in pairs(headers) do
+        response = response .. k .. ': ' .. v .. '\r\n'
+    end
     response = response .. 'Content-Length: ' .. (#body or 0) .. '\r\n'
     response = response .. 'Connection: close\r\n'
     response = response .. '\r\n'
@@ -443,7 +445,13 @@ local function handle_nip11(conn, _)
         relay_info['icon'] = relay_icon
     end
     local body = cjson.encode(relay_info)
-    write_http_response(conn, '200 OK', 'application/nostr+json', body)
+    local headers = {
+        ['Accept'] = 'application/nostr+json',
+        ['Access-Control-Allow-Origin'] = '*',
+        ['Access-Control-Allow-Headers'] = 'Content-Type, Accept',
+        ['Access-Control-Allow-Methods'] = 'GET'
+    }
+    write_http_response(conn, '200 OK', headers, body)
 end
 
 local MIME_TYPES = {
@@ -486,7 +494,7 @@ local function handle_static_file(conn, path)
     local f = io.open(file_path, 'rb')
     if not f then
         log.warn(string.format('404 Not Found for static file: %s', file_path))
-        write_http_response(conn, '404 Not Found', 'text/plain', '404 Not Found')
+        write_http_response(conn, '404 Not Found', {['Content-Type'] = 'text/plain'}, '404 Not Found')
         return
     end
 
@@ -496,7 +504,7 @@ local function handle_static_file(conn, path)
     local ext = string.match(filename, '%.([^%.]+)$')
     local content_type = MIME_TYPES[ext] or 'application/octet-stream'
     log.debug(string.format('Static file found and served: %s (Type: %s)', file_path, content_type))
-    write_http_response(conn, '200 OK', content_type, content)
+    write_http_response(conn, '200 OK', {['Content-Type'] = content_type}, content)
 end
 
 ----------------------------------------------------------------
