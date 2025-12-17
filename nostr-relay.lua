@@ -229,13 +229,13 @@ local function handle_replaceable_event(event)
 
     if is_replaceable(kind) then
         con:execParams([[
-            DELETE FROM event WHERE pubkey = $1 AND kind = $2
-        ]], event['pubkey'], event['kind'])
+            DELETE FROM event WHERE pubkey = $1 AND kind = $2 AND created_at < $3
+        ]], event['pubkey'], event['kind'], event['created_at'])
     elseif is_parameterized_replaceable(kind) then
         local d_tag = get_d_tag(event['tags'])
         con:execParams([[
-            DELETE FROM event WHERE pubkey = $1 AND kind = $2 AND tags @> $3
-        ]], event['pubkey'], event['kind'], to_json({{'d', d_tag}}))
+            DELETE FROM event WHERE pubkey = $1 AND kind = $2 AND $3 = ANY(tagvalues) AND created_at < $4
+        ]], event['pubkey'], event['kind'], d_tag, event['created_at'])
     end
 
     return false -- Store the event
@@ -292,6 +292,10 @@ local function handle_websocket(ws)
         end
 
         log.debug(string.format('Received raw message: %s', message))
+
+        if message == '' or message:match('^%s*$') then
+            goto continue
+        end
 
         local ok, payload = pcall(cjson.decode, message)
         if not ok then 
