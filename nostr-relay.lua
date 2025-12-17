@@ -436,6 +436,7 @@ local function handle_nip11(conn, _)
         description = os.getenv('RELAY_DESCRIPTION') or 'A simple Nostr relay powered by Copas/LuaSocket.',
         pubkey = os.getenv('RELAY_PUBKEY') or '',
         contact = os.getenv('RELAY_CONTACT') or '',
+        icon = os.getenv('RELAY_ICON') or '',
         supported_nips = {1, 2, 4, 9, 11, 12, 15, 16, 20, 22, 28, 33, 40},
         software = 'lua-nostr-relay',
         version = '0.0.1'
