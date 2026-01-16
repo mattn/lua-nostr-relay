@@ -18,6 +18,15 @@ log.info('Connecting to PostgreSQL...')
 local con = assert(pgsql.connectdb(database_url))
 log.info('PostgreSQL connected.')
 
+-- Ensure connection is active, reconnect if needed
+local function ensure_connection()
+    if not con then
+        log.warn('Reconnecting to PostgreSQL...')
+        con = assert(pgsql.connectdb(database_url))
+        log.info('PostgreSQL reconnected.')
+    end
+end
+
 -- Prepare schema
 log.info('Preparing database schema...')
 con:exec([[
@@ -351,6 +360,7 @@ local function handle_websocket(ws)
 
             local skip_storage = handle_replaceable_event(ev)
 
+            ensure_connection()
             local result = true
             if not skip_storage then
                 result = con:execParams([[
@@ -380,12 +390,13 @@ local function handle_websocket(ws)
 
             subscribers[ws][sub_id] = { ['filters'] = filters }
 
+            ensure_connection()
             local sql, params = build_filter_query(filters)
-            local res = con:execParams(sql, table.unpack(params))
+            local res, err = con:execParams(sql, table.unpack(params))
             if not res then
-                log.error('Failed to query records')
-                ws:send(cjson.encode({'NOTICE', 'Failed  to query records'}))
-                ws:send(cjson.encode({'CLOSED', sub_id, 'Failed  to query records'}))
+                log.error('Failed to query records: %s', err or 'unknown error')
+                ws:send(cjson.encode({'NOTICE', 'Failed to query records'}))
+                ws:send(cjson.encode({'CLOSED', sub_id, 'Failed to query records'}))
                 goto continue
             end
 
