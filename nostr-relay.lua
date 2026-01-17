@@ -112,7 +112,7 @@ local function to_json(value)
                 return '{' .. table.concat(parts, ',') .. '}'
             end
         else
-            log.error('JSON serialization failed for type: %s', tp)
+            log.error(string.format('JSON serialization failed for type: %s', tp))
             error('invalid value: ' .. tp)
         end
     end
@@ -377,7 +377,7 @@ local function handle_websocket(ws)
                 ws:send(cjson.encode({'OK', ev['id'], true, ''}))
                 broadcast_event(ev)
             else
-                log.error(string.format('Failed to store EVENT %s.', ev['id']))
+                log.error(string.format('Failed to store EVENT %s', ev['id']))
                 ws:send(cjson.encode({'OK', ev['id'], false, 'failed to insert record'}))
             end
 
@@ -394,7 +394,7 @@ local function handle_websocket(ws)
             local sql, params = build_filter_query(filters)
             local res, err = con:execParams(sql, table.unpack(params))
             if not res then
-                log.error('Failed to query records: %s', err or 'unknown error')
+                log.error(string.format('Failed to query records: %s', err or 'unknown error'))
                 ws:send(cjson.encode({'NOTICE', 'Failed to query records'}))
                 ws:send(cjson.encode({'CLOSED', sub_id, 'Failed to query records'}))
                 goto continue
