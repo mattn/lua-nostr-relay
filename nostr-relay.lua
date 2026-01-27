@@ -140,7 +140,7 @@ local function build_filter_query(filters)
             params[#params+1] = id
             idx = idx + 1
         end
-        table.insert(where, 'id = ANY(ARRAY[' .. table.concat(list, ',') .. '])')
+        table.insert(where, 'id = ANY(ARRAY[' .. table.concat(list, ',') .. ']::text[])')
     end
 
     -- authors
@@ -151,7 +151,7 @@ local function build_filter_query(filters)
             params[#params+1] = a
             idx = idx + 1
         end
-        table.insert(where, 'pubkey = ANY(ARRAY[' .. table.concat(list, ',') .. '])')
+        table.insert(where, 'pubkey = ANY(ARRAY[' .. table.concat(list, ',') .. ']::text[])')
     end
 
     -- kinds
@@ -162,7 +162,7 @@ local function build_filter_query(filters)
             params[#params+1] = k
             idx = idx + 1
         end
-        table.insert(where, 'kind = ANY(ARRAY[' .. table.concat(list, ',') .. '])')
+        table.insert(where, 'kind = ANY(ARRAY[' .. table.concat(list, ',') .. ']::integer[])')
     end
 
     -- since
@@ -177,6 +177,19 @@ local function build_filter_query(filters)
         table.insert(where, 'created_at <= $' .. idx)
         params[#params+1] = filters['until']
         idx = idx + 1
+    end
+
+    -- tag filters (#e, #p, etc.)
+    for key, values in pairs(filters) do
+        if type(key) == 'string' and key:sub(1, 1) == '#' and type(values) == 'table' then
+            local list = {}
+            for _, v in ipairs(values) do
+                list[#list+1] = string.format('$%d', idx)
+                params[#params+1] = v
+                idx = idx + 1
+            end
+            table.insert(where, 'tagvalues && ARRAY[' .. table.concat(list, ',') .. ']::text[]')
+        end
     end
 
     local sql = 'SELECT id, pubkey, created_at, kind, tags, content, sig FROM event'
