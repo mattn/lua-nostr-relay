@@ -339,6 +339,15 @@ local function handle_websocket(ws)
                 goto continue
             end
 
+            -- NIP-70: Reject protected events (events with ["-"] tag)
+            for _, tag in ipairs(ev['tags']) do
+                if tag[1] == '-' then
+                    log.warn(string.format('Rejected protected event %s (NIP-70)', ev['id']))
+                    ws:send(cjson.encode({'OK', ev['id'], false, 'auth-required: this event may only be published by its author'}))
+                    goto continue
+                end
+            end
+
             local kind = tonumber(ev['kind'])
             if kind == 5 then
                 -- Handle deletion event (kind 5)
@@ -461,7 +470,7 @@ local function handle_nip11(conn, _)
         pubkey = os.getenv('RELAY_PUBKEY') or '',
         contact = os.getenv('RELAY_CONTACT') or '',
         icon = os.getenv('RELAY_ICON') or '',
-        supported_nips = {1, 2, 4, 9, 11, 12, 15, 16, 20, 22, 28, 33, 40},
+        supported_nips = {1, 2, 4, 9, 11, 12, 15, 16, 20, 22, 28, 33, 40, 70},
         software = 'lua-nostr-relay',
         version = '0.0.1'
     }
