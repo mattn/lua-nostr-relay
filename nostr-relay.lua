@@ -20,7 +20,7 @@ log.info('PostgreSQL connected.')
 
 -- Ensure connection is active, reconnect if needed
 local function ensure_connection()
-    if not con then
+    if not con or con:status() ~= pgsql.CONNECTION_OK then
         log.warn('Reconnecting to PostgreSQL...')
         con = assert(pgsql.connectdb(database_url))
         log.info('PostgreSQL reconnected.')
@@ -414,9 +414,10 @@ local function handle_websocket(ws)
 
             ensure_connection()
             local sql, params = build_filter_query(filters)
-            local res, err = con:execParams(sql, table.unpack(params))
-            if not res then
-                log.error(string.format('Failed to query records: %s', err or 'unknown error'))
+            local res = con:execParams(sql, table.unpack(params))
+            if not res or res:status() ~= pgsql.PGRES_TUPLES_OK then
+                local errmsg = res and res:errorMessage() or con:errorMessage()
+                log.error(string.format('Failed to query records: %s', errmsg or 'unknown error'))
                 ws:send(cjson.encode({'NOTICE', 'Failed to query records'}))
                 ws:send(cjson.encode({'CLOSED', sub_id, 'Failed to query records'}))
                 goto continue
