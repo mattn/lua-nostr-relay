@@ -465,6 +465,10 @@ end
 
 local function handle_nip11(conn, _)
     log.info('Handling NIP-11 (Relay Information Document) request.')
+    local relay_countries = {}
+    for country in (os.getenv('RELAY_COUNTRIES') or 'JP'):gmatch('[^,%s]+') do
+        relay_countries[#relay_countries + 1] = country
+    end
     local relay_info = {
         name = os.getenv('RELAY_NAME') or 'Lua Nostr Relay',
         description = os.getenv('RELAY_DESCRIPTION') or 'A simple Nostr relay powered by Copas/LuaSocket.',
@@ -472,6 +476,7 @@ local function handle_nip11(conn, _)
         contact = os.getenv('RELAY_CONTACT') or '',
         icon = os.getenv('RELAY_ICON') or '',
         supported_nips = {1, 2, 4, 9, 11, 12, 15, 16, 20, 22, 28, 33, 40, 70},
+        relay_countries = relay_countries,
         software = 'lua-nostr-relay',
         version = '0.0.1'
     }
