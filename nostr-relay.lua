@@ -303,17 +303,20 @@ end
 ----------------------------------------------------------------
 -- Main relay handler
 ----------------------------------------------------------------
-local function handle_websocket(ws)
+local function handle_websocket(ws, client_ip)
+    client_ip = client_ip or '-'
     subscribers[ws] = {}
+    log.info(string.format('[%s] Client connected', client_ip))
 
     while true do
         local message = ws:receive()
         if not message then
             subscribers[ws] = nil
+            log.info(string.format('[%s] Client disconnected', client_ip))
             return
         end
 
-        log.debug(string.format('Received raw message: %s', message))
+        log.debug(string.format('[%s] Received raw message: %s', client_ip, message))
 
         if message == '' or message:match('^%s*$') then
             goto continue
@@ -588,6 +591,19 @@ local function read_headers(sock)
 end
 
 ----------------------------------------------------------------
+-- Extract the real client IP from proxy headers (e.g. Cloudflare Tunnel /
+-- reverse proxy). Falls back to the peer address, or "-" when unknown.
+local function extract_forwarded_ip(headers, peer_name)
+    for _, name in ipairs({'cf-connecting-ip', 'x-forwarded-for', 'x-real-ip'}) do
+        local value = headers and headers[name]
+        if value and value ~= '' then
+            -- X-Forwarded-For may be a comma separated list; take the first entry.
+            return (value:match('^%s*([^,]+)') or value):gsub('%s+$', '')
+        end
+    end
+    return peer_name or '-'
+end
+
 -- handle HTTP connection. called per clients
 ----------------------------------------------------------------
 local function handle_connection(sock)
@@ -601,6 +617,8 @@ local function handle_connection(sock)
         sock:close()
         return
     end
+
+    local client_ip = extract_forwarded_ip(headers, peer_name)
 
     local is_websocket = headers['upgrade'] == 'websocket' and headers['connection'] == 'upgrade'
     if is_websocket then
@@ -631,7 +649,7 @@ local function handle_connection(sock)
             log.debug(string.format('Closing underlying socket for %s.', peer_name))
         end
         ws = sync.extend(ws)
-        handle_websocket(ws)
+        handle_websocket(ws, client_ip)
     elseif headers['accept'] == 'application/nostr+json' then
         log.info(string.format('Connection %s handling NIP-11.', peer_name))
         handle_nip11(conn, headers)
