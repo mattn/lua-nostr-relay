@@ -236,6 +236,172 @@ local function get_d_tag(tags)
 end
 
 ----------------------------------------------------------------
+-- SHA-256 (pure Lua, used to hash NIP-26 delegation tokens)
+----------------------------------------------------------------
+local band, bor, bxor, bnot, rshift, lshift
+if bit32 then
+    -- Lua 5.2
+    band, bor, bxor, bnot = bit32.band, bit32.bor, bit32.bxor, bit32.bnot
+    rshift, lshift = bit32.rshift, bit32.lshift
+else
+    -- Lua 5.3+ has native bitwise operators
+    local make = assert(load([[
+        return function(a, b) return a & b end,
+               function(a, b) return a | b end,
+               function(a, b) return a ~ b end,
+               function(a) return ~a & 0xffffffff end,
+               function(a, n) return a >> n end,
+               function(a, n) return (a << n) & 0xffffffff end
+    ]]))
+    band, bor, bxor, bnot, rshift, lshift = make()
+end
+
+local function rrotate(x, n)
+    return bor(rshift(x, n), lshift(x, 32 - n))
+end
+
+local SHA256_K = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+}
+
+local function sha256(msg)
+    local h1, h2, h3, h4 = 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a
+    local h5, h6, h7, h8 = 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+
+    -- Pad message: append 0x80, zeros, then 64-bit big-endian bit length
+    local len = #msg
+    msg = msg .. '\128' .. string.rep('\0', (55 - len) % 64)
+    local bits = len * 8
+    local lenbytes = ''
+    for _ = 1, 8 do
+        lenbytes = string.char(bits % 256) .. lenbytes
+        bits = math.floor(bits / 256)
+    end
+    msg = msg .. lenbytes
+
+    for chunk = 1, #msg, 64 do
+        local w = {}
+        for i = 0, 15 do
+            local b1, b2, b3, b4 = msg:byte(chunk + i * 4, chunk + i * 4 + 3)
+            w[i + 1] = ((b1 * 256 + b2) * 256 + b3) * 256 + b4
+        end
+        for i = 17, 64 do
+            local s0 = bxor(bxor(rrotate(w[i - 15], 7), rrotate(w[i - 15], 18)), rshift(w[i - 15], 3))
+            local s1 = bxor(bxor(rrotate(w[i - 2], 17), rrotate(w[i - 2], 19)), rshift(w[i - 2], 10))
+            w[i] = (w[i - 16] + s0 + w[i - 7] + s1) % 0x100000000
+        end
+
+        local a, b, c, d, e, f, g, h = h1, h2, h3, h4, h5, h6, h7, h8
+        for i = 1, 64 do
+            local s1 = bxor(bxor(rrotate(e, 6), rrotate(e, 11)), rrotate(e, 25))
+            local ch = bxor(band(e, f), band(bnot(e), g))
+            local temp1 = (h + s1 + ch + SHA256_K[i] + w[i]) % 0x100000000
+            local s0 = bxor(bxor(rrotate(a, 2), rrotate(a, 13)), rrotate(a, 22))
+            local maj = bxor(bxor(band(a, b), band(a, c)), band(b, c))
+            local temp2 = (s0 + maj) % 0x100000000
+            h = g
+            g = f
+            f = e
+            e = (d + temp1) % 0x100000000
+            d = c
+            c = b
+            b = a
+            a = (temp1 + temp2) % 0x100000000
+        end
+
+        h1 = (h1 + a) % 0x100000000
+        h2 = (h2 + b) % 0x100000000
+        h3 = (h3 + c) % 0x100000000
+        h4 = (h4 + d) % 0x100000000
+        h5 = (h5 + e) % 0x100000000
+        h6 = (h6 + f) % 0x100000000
+        h7 = (h7 + g) % 0x100000000
+        h8 = (h8 + h) % 0x100000000
+    end
+
+    return string.format('%08x%08x%08x%08x%08x%08x%08x%08x', h1, h2, h3, h4, h5, h6, h7, h8)
+end
+
+----------------------------------------------------------------
+-- NIP-26: Delegated event signing
+----------------------------------------------------------------
+local function validate_delegation_conditions(event, conditions)
+    local kind_present = false
+    local kind_allowed = false
+    local created_at_valid = true
+
+    for condition in conditions:gmatch('[^&]+') do
+        if condition:sub(1, 5) == 'kind=' then
+            kind_present = true
+            local allowed_kind = tonumber(condition:sub(6), 10)
+            if allowed_kind and tonumber(event['kind']) == allowed_kind then
+                kind_allowed = true
+            end
+        elseif condition:sub(1, 11) == 'created_at<' then
+            local max_time = tonumber(condition:sub(12), 10)
+            if max_time and tonumber(event['created_at']) >= max_time then
+                created_at_valid = false
+            end
+        elseif condition:sub(1, 11) == 'created_at>' then
+            local min_time = tonumber(condition:sub(12), 10)
+            if min_time and tonumber(event['created_at']) <= min_time then
+                created_at_valid = false
+            end
+        end
+    end
+
+    return (kind_allowed or not kind_present) and created_at_valid
+end
+
+local function validate_delegation(event)
+    local delegation_tag = nil
+    for _, tag in ipairs(event['tags']) do
+        if type(tag) == 'table' and tag[1] == 'delegation' and #tag >= 4 then
+            delegation_tag = tag
+            break
+        end
+    end
+
+    if not delegation_tag then
+        return true -- No delegation tag, accept as usual
+    end
+
+    if #delegation_tag ~= 4 then
+        return false
+    end
+
+    local delegator_pubkey = delegation_tag[2]
+    local conditions = delegation_tag[3]
+    local signature = delegation_tag[4]
+
+    if type(delegator_pubkey) ~= 'string' or type(conditions) ~= 'string' or type(signature) ~= 'string' then
+        return false
+    end
+    if delegator_pubkey == '' or conditions == '' or signature == '' then
+        return false
+    end
+    if #delegator_pubkey ~= 64 or not delegator_pubkey:match('^%x+$') then
+        return false
+    end
+
+    if not validate_delegation_conditions(event, conditions) then
+        return false
+    end
+
+    -- The delegation token is a schnorr signature by the delegator over
+    -- sha256('nostr:delegation:<delegatee pubkey>:<conditions>')
+    local token = string.format('nostr:delegation:%s:%s', event['pubkey'], conditions)
+    return schnorr.verify(signature, sha256(token), delegator_pubkey)
+end
+
+----------------------------------------------------------------
 -- Handle replaceable events
 ----------------------------------------------------------------
 local function handle_replaceable_event(event)
@@ -339,6 +505,13 @@ local function handle_websocket(ws, client_ip)
             if not schnorr.verify(ev['sig'], ev['id'], ev['pubkey']) then
                 log.error(string.format('Invalid event signature %s', ev['sig']))
                 ws:send(cjson.encode({'NOTICE', 'Invalid event signature'}))
+                goto continue
+            end
+
+            -- NIP-26: Reject events with an invalid delegation tag
+            if not validate_delegation(ev) then
+                log.warn(string.format('Rejected event %s with invalid delegation (NIP-26)', ev['id']))
+                ws:send(cjson.encode({'OK', ev['id'], false, 'invalid: delegation verification failed'}))
                 goto continue
             end
 
@@ -478,7 +651,7 @@ local function handle_nip11(conn, _)
         pubkey = os.getenv('RELAY_PUBKEY') or '',
         contact = os.getenv('RELAY_CONTACT') or '',
         icon = os.getenv('RELAY_ICON') or '',
-        supported_nips = {1, 2, 4, 9, 11, 12, 15, 16, 20, 22, 28, 33, 40, 70},
+        supported_nips = {1, 2, 4, 9, 11, 12, 15, 16, 20, 22, 26, 28, 33, 40, 70},
         relay_countries = relay_countries,
         software = 'lua-nostr-relay',
         version = '0.0.1'
