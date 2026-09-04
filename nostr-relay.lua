@@ -127,7 +127,7 @@ local subscribers = {}
 ----------------------------------------------------------------
 -- SQL builder for REQ filter
 ----------------------------------------------------------------
-local function build_filter_query(filters)
+local function build_filter_query(filters, count_only)
     local where = {}
     local params = {}
     local idx = 1
@@ -192,16 +192,23 @@ local function build_filter_query(filters)
         end
     end
 
-    local sql = 'SELECT id, pubkey, created_at, kind, tags, content, sig FROM event'
+    local sql
+    if count_only then
+        sql = 'SELECT id FROM event'
+    else
+        sql = 'SELECT id, pubkey, created_at, kind, tags, content, sig FROM event'
+    end
     if #where > 0 then
         sql = sql .. ' WHERE ' .. table.concat(where, ' AND ')
     end
-    sql = sql .. ' ORDER BY created_at DESC'
+    if not count_only then
+        sql = sql .. ' ORDER BY created_at DESC'
 
-    if filters['limit'] then
-        sql = sql .. ' LIMIT ' .. tonumber(filters['limit'])
-    else
-        sql = sql .. ' LIMIT 500'
+        if filters['limit'] then
+            sql = sql .. ' LIMIT ' .. tonumber(filters['limit'])
+        else
+            sql = sql .. ' LIMIT 500'
+        end
     end
 
     return sql, params
@@ -614,6 +621,43 @@ local function handle_websocket(ws, client_ip)
             ws:send(cjson.encode({'EOSE', sub_id}))
 
         ------------------------------------------------------------
+        -- COUNT
+        ------------------------------------------------------------
+        elseif method == 'COUNT' then
+            local query_id = payload[2]
+            local seen = {}
+            local count = 0
+
+            if not query_id or #payload < 3 then
+                ws:send(cjson.encode({'CLOSED', query_id or '', 'error: invalid COUNT request'}))
+                goto continue
+            end
+
+            ensure_connection()
+            for i = 3, #payload do
+                local filter = payload[i]
+                if type(filter) ~= 'table' then
+                    ws:send(cjson.encode({'CLOSED', query_id, 'error: invalid filter'}))
+                    goto continue
+                end
+                local sql, params = build_filter_query(filter, true)
+                local res = con:execParams(sql, table.unpack(params))
+                if not res or res:status() ~= pgsql.PGRES_TUPLES_OK then
+                    local errmsg = res and res:errorMessage() or con:errorMessage()
+                    log.error(string.format('Failed to count records: %s', errmsg or 'unknown error'))
+                    ws:send(cjson.encode({'CLOSED', query_id, 'error: could not count records'}))
+                    goto continue
+                end
+                for tuple,_ in res:tuples() do
+                    if not seen[tuple.id] then
+                        seen[tuple.id] = true
+                        count = count + 1
+                    end
+                end
+            end
+            ws:send(cjson.encode({'COUNT', query_id, {count = count}}))
+
+        ------------------------------------------------------------
         -- CLOSE
         ------------------------------------------------------------
         elseif method == 'CLOSE' then
@@ -651,7 +695,7 @@ local function handle_nip11(conn, _)
         pubkey = os.getenv('RELAY_PUBKEY') or '',
         contact = os.getenv('RELAY_CONTACT') or '',
         icon = os.getenv('RELAY_ICON') or '',
-        supported_nips = {1, 4, 9, 11, 40, 66, 70, 78},
+        supported_nips = {1, 4, 9, 11, 40, 45, 66, 70, 78},
         relay_countries = relay_countries,
         software = 'lua-nostr-relay',
         version = '0.0.1'
