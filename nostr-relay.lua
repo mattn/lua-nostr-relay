@@ -478,7 +478,7 @@ local function handle_nip11(conn, _)
         pubkey = os.getenv('RELAY_PUBKEY') or '',
         contact = os.getenv('RELAY_CONTACT') or '',
         icon = os.getenv('RELAY_ICON') or '',
-        supported_nips = {1, 2, 4, 9, 11, 12, 15, 16, 20, 22, 28, 33, 40, 70},
+        supported_nips = {1, 4, 9, 11, 40, 70},
         relay_countries = relay_countries,
         software = 'lua-nostr-relay',
         version = '0.0.1'
