@@ -533,6 +533,10 @@ local function handle_websocket(ws, client_ip, relay_url)
             log.warn(string.format('Failed to decode JSON from message: %s', payload))
             goto continue 
         end
+        if type(payload) ~= 'table' then
+            log.warn(string.format('[%s] Ignoring non-array JSON message', client_ip))
+            goto continue
+        end
 
         local method = payload[1]
 
