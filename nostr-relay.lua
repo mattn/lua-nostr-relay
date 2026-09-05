@@ -152,7 +152,8 @@ local function build_filter_query(filters, count_only, authenticated_pubkeys)
             params[#params+1] = a
             idx = idx + 1
         end
-        table.insert(where, 'pubkey = ANY(ARRAY[' .. table.concat(list, ',') .. ']::text[])')
+        local authors = 'ARRAY[' .. table.concat(list, ',') .. ']::text[]'
+        table.insert(where, "(pubkey = ANY(" .. authors .. ") OR EXISTS (SELECT 1 FROM jsonb_array_elements(tags) tag WHERE tag->>0 = 'delegation' AND tag->>1 = ANY(" .. authors .. ')))')
     end
 
     -- kinds
@@ -361,23 +362,40 @@ local function validate_delegation_conditions(event, conditions)
         if condition:sub(1, 5) == 'kind=' then
             kind_present = true
             local allowed_kind = tonumber(condition:sub(6), 10)
-            if allowed_kind and tonumber(event['kind']) == allowed_kind then
+            if not allowed_kind then
+                return false
+            elseif tonumber(event['kind']) == allowed_kind then
                 kind_allowed = true
             end
         elseif condition:sub(1, 11) == 'created_at<' then
             local max_time = tonumber(condition:sub(12), 10)
-            if max_time and tonumber(event['created_at']) >= max_time then
+            if not max_time then
+                return false
+            elseif tonumber(event['created_at']) >= max_time then
                 created_at_valid = false
             end
         elseif condition:sub(1, 11) == 'created_at>' then
             local min_time = tonumber(condition:sub(12), 10)
-            if min_time and tonumber(event['created_at']) <= min_time then
+            if not min_time then
+                return false
+            elseif tonumber(event['created_at']) <= min_time then
                 created_at_valid = false
             end
+        else
+            return false
         end
     end
 
     return (kind_allowed or not kind_present) and created_at_valid
+end
+
+local function delegated_by(event, pubkey)
+    for _, tag in ipairs(event['tags'] or {}) do
+        if type(tag) == 'table' and tag[1] == 'delegation' and tag[2] == pubkey then
+            return true
+        end
+    end
+    return false
 end
 
 local function validate_delegation(event)
@@ -470,7 +488,7 @@ local function broadcast_event(event)
             if filters['authors'] then
                 local ok = false
                 for _,a in ipairs(filters['authors']) do
-                    if event['pubkey'] == a then ok = true break end
+                    if event['pubkey'] == a or delegated_by(event, a) then ok = true break end
                 end
                 if not ok then goto continue end
             end
@@ -592,9 +610,12 @@ local function handle_websocket(ws, client_ip, relay_url)
                                 DELETE FROM event WHERE id = $1
                             ]], tag[2])
                         else
-                            con:execParams([[
-                                DELETE FROM event WHERE id = $1 AND pubkey = $2
-                            ]], tag[2], ev['pubkey'])
+                            local stored_tags = cjson.decode(res[1].tags)
+                            if res[1].pubkey == ev['pubkey'] or delegated_by({tags = stored_tags}, ev['pubkey']) then
+                                con:execParams([[
+                                    DELETE FROM event WHERE id = $1
+                                ]], tag[2])
+                            end
                         end
                     end
                 end
@@ -768,7 +789,7 @@ local function handle_nip11(conn, _)
         pubkey = os.getenv('RELAY_PUBKEY') or '',
         contact = os.getenv('RELAY_CONTACT') or '',
         icon = os.getenv('RELAY_ICON') or '',
-        supported_nips = {1, 4, 9, 11, 17, 40, 42, 45, 59, 66, 70, 78},
+        supported_nips = {1, 4, 9, 11, 17, 26, 40, 42, 45, 59, 66, 70, 78},
         relay_countries = relay_countries,
         software = 'lua-nostr-relay',
         version = '0.0.1'
