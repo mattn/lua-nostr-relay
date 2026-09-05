@@ -123,11 +123,12 @@ end
 -- Subscribers table
 ----------------------------------------------------------------
 local subscribers = {}
+local client_auth = {}
 
 ----------------------------------------------------------------
 -- SQL builder for REQ filter
 ----------------------------------------------------------------
-local function build_filter_query(filters, count_only)
+local function build_filter_query(filters, count_only, authenticated_pubkeys)
     local where = {}
     local params = {}
     local idx = 1
@@ -177,6 +178,18 @@ local function build_filter_query(filters, count_only)
         table.insert(where, 'created_at <= $' .. idx)
         params[#params+1] = filters['until']
         idx = idx + 1
+    end
+
+    local auth_placeholders = {}
+    for pubkey in pairs(authenticated_pubkeys or {}) do
+        auth_placeholders[#auth_placeholders+1] = string.format('$%d', idx)
+        params[#params+1] = pubkey
+        idx = idx + 1
+    end
+    if #auth_placeholders == 0 then
+        table.insert(where, 'kind <> 1059')
+    else
+        table.insert(where, "(kind <> 1059 OR EXISTS (SELECT 1 FROM jsonb_array_elements(tags) tag WHERE tag->>0 = 'p' AND tag->>1 = ANY(ARRAY[" .. table.concat(auth_placeholders, ',') .. ']::text[])))')
     end
 
     -- tag filters (#e, #p, etc.)
@@ -465,6 +478,15 @@ local function broadcast_event(event)
             if filters['since'] and event['created_at'] < filters['since'] then goto continue end
             if filters['until'] and event['created_at'] > filters['until'] then goto continue end
 
+            if event['kind'] == 1059 then
+                local auth = client_auth[ws] or {}
+                local recipient = false
+                for _, tag in ipairs(event['tags'] or {}) do
+                    if tag[1] == 'p' and auth[tag[2]] then recipient = true break end
+                end
+                if not recipient then goto continue end
+            end
+
             log.debug('Sending EVENT %s to subscriber %s', event['id'], sub_id)
             ws:send(to_json({'EVENT', sub_id, event}))
 
@@ -476,15 +498,26 @@ end
 ----------------------------------------------------------------
 -- Main relay handler
 ----------------------------------------------------------------
-local function handle_websocket(ws, client_ip)
+local function random_challenge()
+    local file = assert(io.open('/dev/urandom', 'rb'))
+    local bytes = assert(file:read(32))
+    file:close()
+    return (bytes:gsub('.', function(c) return string.format('%02x', string.byte(c)) end))
+end
+
+local function handle_websocket(ws, client_ip, relay_url)
     client_ip = client_ip or '-'
     subscribers[ws] = {}
+    client_auth[ws] = {}
+    local challenge = random_challenge()
     log.info(string.format('[%s] Client connected', client_ip))
+    ws:send(cjson.encode({'AUTH', challenge}))
 
     while true do
         local message = ws:receive()
         if not message then
             subscribers[ws] = nil
+            client_auth[ws] = nil
             log.info(string.format('[%s] Client disconnected', client_ip))
             return
         end
@@ -522,9 +555,9 @@ local function handle_websocket(ws, client_ip)
                 goto continue
             end
 
-            -- NIP-70: Reject protected events (events with ["-"] tag)
+            -- NIP-70: protected events require authentication as the author.
             for _, tag in ipairs(ev['tags']) do
-                if tag[1] == '-' then
+                if tag[1] == '-' and not client_auth[ws][ev['pubkey']] then
                     log.warn(string.format('Rejected protected event %s (NIP-70)', ev['id']))
                     ws:send(cjson.encode({'OK', ev['id'], false, 'auth-required: this event may only be published by its author'}))
                     goto continue
@@ -596,7 +629,7 @@ local function handle_websocket(ws, client_ip)
             subscribers[ws][sub_id] = { ['filters'] = filters }
 
             ensure_connection()
-            local sql, params = build_filter_query(filters)
+            local sql, params = build_filter_query(filters, false, client_auth[ws])
             local res = con:execParams(sql, table.unpack(params))
             if not res or res:status() ~= pgsql.PGRES_TUPLES_OK then
                 local errmsg = res and res:errorMessage() or con:errorMessage()
@@ -640,7 +673,7 @@ local function handle_websocket(ws, client_ip)
                     ws:send(cjson.encode({'CLOSED', query_id, 'error: invalid filter'}))
                     goto continue
                 end
-                local sql, params = build_filter_query(filter, true)
+                local sql, params = build_filter_query(filter, true, client_auth[ws])
                 local res = con:execParams(sql, table.unpack(params))
                 if not res or res:status() ~= pgsql.PGRES_TUPLES_OK then
                     local errmsg = res and res:errorMessage() or con:errorMessage()
@@ -656,6 +689,42 @@ local function handle_websocket(ws, client_ip)
                 end
             end
             ws:send(cjson.encode({'COUNT', query_id, {count = count}}))
+
+        ------------------------------------------------------------
+        -- AUTH
+        ------------------------------------------------------------
+        elseif method == 'AUTH' then
+            local ev = payload[2]
+            local id = type(ev) == 'table' and (ev['id'] or '') or ''
+            local function reject(reason)
+                ws:send(cjson.encode({'OK', id, false, 'invalid: ' .. reason}))
+            end
+            if type(ev) ~= 'table' or ev['kind'] ~= 22242 then
+                reject('authentication event must be kind 22242')
+                goto continue
+            end
+            if type(ev['created_at']) ~= 'number' or math.abs(os.time() - ev['created_at']) > 600 then
+                reject('authentication event timestamp is out of range')
+                goto continue
+            end
+            local challenge_matches, relay_matches = false, false
+            for _, tag in ipairs(ev['tags'] or {}) do
+                if tag[1] == 'challenge' and tag[2] == challenge then challenge_matches = true end
+                if tag[1] == 'relay' then
+                    local actual = tostring(tag[2] or ''):lower():gsub('/+$', '')
+                    local expected = tostring(relay_url or ''):lower():gsub('/+$', '')
+                    if actual == expected then relay_matches = true end
+                end
+            end
+            if not challenge_matches then reject('authentication challenge does not match') goto continue end
+            if not relay_matches then reject('authentication relay does not match') goto continue end
+            local serialized = to_json({0, ev['pubkey'], ev['created_at'], ev['kind'], ev['tags'], ev['content']})
+            if sha256(serialized) ~= ev['id'] or not schnorr.verify(ev['sig'], ev['id'], ev['pubkey']) then
+                reject('authentication signature verification failed')
+                goto continue
+            end
+            client_auth[ws][ev['pubkey']] = true
+            ws:send(cjson.encode({'OK', id, true, ''}))
 
         ------------------------------------------------------------
         -- CLOSE
@@ -695,7 +764,7 @@ local function handle_nip11(conn, _)
         pubkey = os.getenv('RELAY_PUBKEY') or '',
         contact = os.getenv('RELAY_CONTACT') or '',
         icon = os.getenv('RELAY_ICON') or '',
-        supported_nips = {1, 4, 9, 11, 40, 45, 66, 70, 78},
+        supported_nips = {1, 4, 9, 11, 17, 40, 42, 45, 59, 66, 70, 78},
         relay_countries = relay_countries,
         software = 'lua-nostr-relay',
         version = '0.0.1'
@@ -866,7 +935,12 @@ local function handle_connection(sock)
             log.debug(string.format('Closing underlying socket for %s.', peer_name))
         end
         ws = sync.extend(ws)
-        handle_websocket(ws, client_ip)
+        local relay_url = os.getenv('RELAY_URL')
+        if not relay_url or relay_url == '' then
+            local scheme = headers['x-forwarded-proto'] == 'http' and 'ws' or 'wss'
+            relay_url = scheme .. '://' .. (headers['x-forwarded-host'] or headers['host'] or '')
+        end
+        handle_websocket(ws, client_ip, relay_url)
     elseif headers['accept'] == 'application/nostr+json' then
         log.info(string.format('Connection %s handling NIP-11.', peer_name))
         handle_nip11(conn, headers)
