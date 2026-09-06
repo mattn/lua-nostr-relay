@@ -228,16 +228,29 @@ local function build_filter_query(filters, count_only, authenticated_pubkeys)
         table.insert(where, "(kind <> 1059 OR EXISTS (SELECT 1 FROM jsonb_array_elements(tags) tag WHERE tag->>0 = 'p' AND tag->>1 = ANY(ARRAY[" .. table.concat(auth_placeholders, ',') .. ']::text[])))')
     end
 
-    -- tag filters (#e, #p, etc.)
+    -- tag filters (#e, #p, etc.): tagvalues && ARRAY[...] narrows via the GIN
+    -- index, the EXISTS clause checks the tag name so that #e and #p cannot
+    -- match each other's values.
     for key, values in pairs(filters) do
         if type(key) == 'string' and key:sub(1, 1) == '#' and type(values) == 'table' then
-            local list = {}
+            local narrow = {}
+            local exact = {}
             for _, v in ipairs(values) do
-                list[#list+1] = string.format('$%d', idx)
+                narrow[#narrow+1] = string.format('$%d', idx)
                 params[#params+1] = v
                 idx = idx + 1
             end
-            table.insert(where, 'tagvalues && ARRAY[' .. table.concat(list, ',') .. ']::text[]')
+            local name_placeholder = string.format('$%d', idx)
+            params[#params+1] = key:sub(2)
+            idx = idx + 1
+            for _, v in ipairs(values) do
+                exact[#exact+1] = string.format('$%d', idx)
+                params[#params+1] = v
+                idx = idx + 1
+            end
+            table.insert(where, '(tagvalues && ARRAY[' .. table.concat(narrow, ',') ..
+                ']::text[] AND EXISTS (SELECT 1 FROM jsonb_array_elements(tags) tag WHERE tag->>0 = ' ..
+                name_placeholder .. ' AND tag->>1 = ANY(ARRAY[' .. table.concat(exact, ',') .. ']::text[])))')
         end
     end
 
@@ -512,6 +525,14 @@ local function broadcast_event(event)
             local filters = info['filters']
             if not filters then goto continue end
 
+            if filters['ids'] then
+                local ok = false
+                for _,id in ipairs(filters['ids']) do
+                    if event['id'] == id then ok = true break end
+                end
+                if not ok then goto continue end
+            end
+
             if filters['kinds'] then
                 local ok = false
                 for _,k in ipairs(filters['kinds']) do
@@ -538,6 +559,27 @@ local function broadcast_event(event)
                     if not content:find(word:lower(), 1, true) then goto continue end
                 end
             end
+
+            -- tag filters (#e, #p, etc.), matching what build_filter_query asks
+            -- the database for, so a subscription answers the same before and
+            -- after EOSE.
+            local tags_ok = true
+            for key, values in pairs(filters) do
+                if type(key) == 'string' and key:sub(1, 1) == '#' and type(values) == 'table' then
+                    local name = key:sub(2)
+                    local found = false
+                    for _, tag in ipairs(event['tags'] or {}) do
+                        if tag[1] == name then
+                            for _, v in ipairs(values) do
+                                if tag[2] == v then found = true break end
+                            end
+                        end
+                        if found then break end
+                    end
+                    if not found then tags_ok = false break end
+                end
+            end
+            if not tags_ok then goto continue end
 
             if event['kind'] == 1059 then
                 local auth = client_auth[ws] or {}
