@@ -126,6 +126,27 @@ local subscribers = {}
 local client_auth = {}
 
 ----------------------------------------------------------------
+-- NIP-50 search
+----------------------------------------------------------------
+-- Split a search string into whitespace separated words. An event matches
+-- when every word occurs in its content, which is also how the live
+-- broadcast path below matches, so stored and streamed results agree.
+local function search_words(search)
+    if type(search) ~= 'string' then return nil end
+    local words = {}
+    for word in search:gmatch('%S+') do
+        words[#words+1] = word
+    end
+    if #words == 0 then return nil end
+    return words
+end
+
+-- Escape the LIKE wildcards so a search for '%' cannot match everything.
+local function escape_like(word)
+    return (word:gsub('[\\%%_]', '\\%0'))
+end
+
+----------------------------------------------------------------
 -- SQL builder for REQ filter
 ----------------------------------------------------------------
 local function build_filter_query(filters, count_only, authenticated_pubkeys)
@@ -178,6 +199,13 @@ local function build_filter_query(filters, count_only, authenticated_pubkeys)
     if filters['until'] then
         table.insert(where, 'created_at <= $' .. idx)
         params[#params+1] = filters['until']
+        idx = idx + 1
+    end
+
+    -- search (NIP-50)
+    for _, word in ipairs(search_words(filters['search']) or {}) do
+        table.insert(where, 'content ILIKE $' .. idx)
+        params[#params+1] = '%' .. escape_like(word) .. '%'
         idx = idx + 1
     end
 
@@ -496,6 +524,14 @@ local function broadcast_event(event)
             if filters['since'] and event['created_at'] < filters['since'] then goto continue end
             if filters['until'] and event['created_at'] > filters['until'] then goto continue end
 
+            local words = search_words(filters['search'])
+            if words then
+                local content = (event['content'] or ''):lower()
+                for _, word in ipairs(words) do
+                    if not content:find(word:lower(), 1, true) then goto continue end
+                end
+            end
+
             if event['kind'] == 1059 then
                 local auth = client_auth[ws] or {}
                 local recipient = false
@@ -789,7 +825,7 @@ local function handle_nip11(conn, _)
         pubkey = os.getenv('RELAY_PUBKEY') or '',
         contact = os.getenv('RELAY_CONTACT') or '',
         icon = os.getenv('RELAY_ICON') or '',
-        supported_nips = {1, 4, 9, 11, 17, 26, 40, 42, 45, 59, 66, 70, 78},
+        supported_nips = {1, 4, 9, 11, 17, 26, 40, 42, 45, 50, 59, 66, 70, 78},
         relay_countries = relay_countries,
         software = 'lua-nostr-relay',
         version = '0.0.1'
