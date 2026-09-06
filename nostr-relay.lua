@@ -53,6 +53,13 @@ CREATE INDEX IF NOT EXISTS timeidx ON event (created_at DESC);
 CREATE INDEX IF NOT EXISTS kindidx ON event (kind);
 CREATE INDEX IF NOT EXISTS kindtimeidx ON event(kind,created_at DESC);
 CREATE INDEX IF NOT EXISTS arbitrarytagvalues ON event USING gin (tagvalues);
+
+-- NIP-50: accelerate substring search (ILIKE '%...%') on content. A pg_trgm
+-- trigram GIN index avoids a sequential scan even with a leading wildcard.
+-- Terms shorter than 3 characters produce no trigrams and still fall back to
+-- a scan.
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE INDEX IF NOT EXISTS contenttrgmidx ON event USING gin (content gin_trgm_ops);
 ]])
 log.info('Database schema prepared.')
 
