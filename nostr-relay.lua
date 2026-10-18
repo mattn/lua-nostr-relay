@@ -518,68 +518,75 @@ end
 ----------------------------------------------------------------
 -- Broadcast EVENT to all subscribers that match filters
 ----------------------------------------------------------------
+-- Whether a single filter matches the event.
+local function filter_matches(filters, event)
+    if filters['ids'] then
+        local ok = false
+        for _,id in ipairs(filters['ids']) do
+            if event['id'] == id then ok = true break end
+        end
+        if not ok then return false end
+    end
+
+    if filters['kinds'] then
+        local ok = false
+        for _,k in ipairs(filters['kinds']) do
+            if event['kind'] == k then ok = true break end
+        end
+        if not ok then return false end
+    end
+
+    if filters['authors'] then
+        local ok = false
+        for _,a in ipairs(filters['authors']) do
+            if event['pubkey'] == a or delegated_by(event, a) then ok = true break end
+        end
+        if not ok then return false end
+    end
+
+    if filters['since'] and event['created_at'] < filters['since'] then return false end
+    if filters['until'] and event['created_at'] > filters['until'] then return false end
+
+    local words = search_words(filters['search'])
+    if words then
+        local content = (event['content'] or ''):lower()
+        for _, word in ipairs(words) do
+            if not content:find(word:lower(), 1, true) then return false end
+        end
+    end
+
+    -- tag filters (#e, #p, etc.), matching what build_filter_query asks
+    -- the database for, so a subscription answers the same before and
+    -- after EOSE.
+    for key, values in pairs(filters) do
+        if type(key) == 'string' and key:sub(1, 1) == '#' and type(values) == 'table' then
+            local name = key:sub(2)
+            local found = false
+            for _, tag in ipairs(event['tags'] or {}) do
+                if tag[1] == name then
+                    for _, v in ipairs(values) do
+                        if tag[2] == v then found = true break end
+                    end
+                end
+                if found then break end
+            end
+            if not found then return false end
+        end
+    end
+
+    return true
+end
+
 local function broadcast_event(event)
     log.info('Broadcasting EVENT ID: %s, Kind: %d', event['id'], event['kind'])
     for ws, subs in pairs(subscribers) do
         for sub_id, info in pairs(subs) do
-            local filters = info['filters']
-            if not filters then goto continue end
-
-            if filters['ids'] then
-                local ok = false
-                for _,id in ipairs(filters['ids']) do
-                    if event['id'] == id then ok = true break end
-                end
-                if not ok then goto continue end
+            -- NIP-01: the filters of a subscription are OR'd
+            local matched = false
+            for _, filters in ipairs(info['filters'] or {}) do
+                if filter_matches(filters, event) then matched = true break end
             end
-
-            if filters['kinds'] then
-                local ok = false
-                for _,k in ipairs(filters['kinds']) do
-                    if event['kind'] == k then ok = true break end
-                end
-                if not ok then goto continue end
-            end
-
-            if filters['authors'] then
-                local ok = false
-                for _,a in ipairs(filters['authors']) do
-                    if event['pubkey'] == a or delegated_by(event, a) then ok = true break end
-                end
-                if not ok then goto continue end
-            end
-
-            if filters['since'] and event['created_at'] < filters['since'] then goto continue end
-            if filters['until'] and event['created_at'] > filters['until'] then goto continue end
-
-            local words = search_words(filters['search'])
-            if words then
-                local content = (event['content'] or ''):lower()
-                for _, word in ipairs(words) do
-                    if not content:find(word:lower(), 1, true) then goto continue end
-                end
-            end
-
-            -- tag filters (#e, #p, etc.), matching what build_filter_query asks
-            -- the database for, so a subscription answers the same before and
-            -- after EOSE.
-            local tags_ok = true
-            for key, values in pairs(filters) do
-                if type(key) == 'string' and key:sub(1, 1) == '#' and type(values) == 'table' then
-                    local name = key:sub(2)
-                    local found = false
-                    for _, tag in ipairs(event['tags'] or {}) do
-                        if tag[1] == name then
-                            for _, v in ipairs(values) do
-                                if tag[2] == v then found = true break end
-                            end
-                        end
-                        if found then break end
-                    end
-                    if not found then tags_ok = false break end
-                end
-            end
-            if not tags_ok then goto continue end
+            if not matched then goto continue end
 
             if event['kind'] == 1059 then
                 local auth = client_auth[ws] or {}
@@ -734,31 +741,52 @@ local function handle_websocket(ws, client_ip, relay_url)
         ------------------------------------------------------------
         elseif method == 'REQ' then
             local sub_id = payload[2]
-            local filters = payload[3]
+            local filters = {}
+            for i = 3, #payload do
+                if type(payload[i]) ~= 'table' then
+                    ws:send(cjson.encode({'CLOSED', sub_id, 'error: invalid filter'}))
+                    goto continue
+                end
+                filters[#filters+1] = payload[i]
+            end
 
             subscribers[ws][sub_id] = { ['filters'] = filters }
 
+            -- NIP-01: the filters are OR'd and each limit applies to its own
+            -- filter, so query them one by one and merge the results.
             ensure_connection()
-            local sql, params = build_filter_query(filters, false, client_auth[ws])
-            local res = con:execParams(sql, table.unpack(params))
-            if not res or res:status() ~= pgsql.PGRES_TUPLES_OK then
-                local errmsg = res and res:errorMessage() or con:errorMessage()
-                log.error(string.format('Failed to query records: %s', errmsg or 'unknown error'))
-                ws:send(cjson.encode({'NOTICE', 'Failed to query records'}))
-                ws:send(cjson.encode({'CLOSED', sub_id, 'Failed to query records'}))
-                goto continue
+            local seen = {}
+            local events = {}
+            for _, filter in ipairs(filters) do
+                local sql, params = build_filter_query(filter, false, client_auth[ws])
+                local res = con:execParams(sql, table.unpack(params))
+                if not res or res:status() ~= pgsql.PGRES_TUPLES_OK then
+                    local errmsg = res and res:errorMessage() or con:errorMessage()
+                    log.error(string.format('Failed to query records: %s', errmsg or 'unknown error'))
+                    ws:send(cjson.encode({'NOTICE', 'Failed to query records'}))
+                    ws:send(cjson.encode({'CLOSED', sub_id, 'Failed to query records'}))
+                    goto continue
+                end
+
+                for tuple,_ in res:tuples() do
+                    if not seen[tuple.id] then
+                        seen[tuple.id] = true
+                        events[#events+1] = {
+                            ['id'] = tuple.id,
+                            ['kind'] = tonumber(tuple.kind),
+                            ['pubkey'] = tuple.pubkey,
+                            ['created_at'] = tonumber(tuple.created_at),
+                            ['content'] = tuple.content,
+                            ['tags'] = cjson.decode(tuple.tags),
+                            ['sig'] = tuple.sig,
+                        }
+                    end
+                end
             end
 
-            for tuple,_ in res:tuples() do
-                ws:send(to_json({'EVENT', sub_id, {
-                    ['id'] = tuple.id,
-                    ['kind'] = tonumber(tuple.kind),
-                    ['pubkey'] = tuple.pubkey,
-                    ['created_at'] = tonumber(tuple.created_at),
-                    ['content'] = tuple.content,
-                    ['tags'] = cjson.decode(tuple.tags),
-                    ['sig'] = tuple.sig,
-                }}))
+            table.sort(events, function(a, b) return a['created_at'] > b['created_at'] end)
+            for _, ev in ipairs(events) do
+                ws:send(to_json({'EVENT', sub_id, ev}))
             end
 
             ws:send(cjson.encode({'EOSE', sub_id}))
