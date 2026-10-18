@@ -739,8 +739,10 @@ local function handle_websocket(ws, client_ip, relay_url)
                             ws:send(cjson.encode({'OK', ev['id'], false, 'Failed  to delete event'}))
                             goto continue
                         end
-                        if tonumber(res[1].kind) == 1059 then
-                            local tags = cjson.decode(res[1].tags)
+                        -- The e tag may point at an event this relay never stored.
+                        local row = res:ntuples() > 0 and res[1] or nil
+                        if row and tonumber(row.kind) == 1059 then
+                            local tags = cjson.decode(row.tags)
                             if not (tags and tags[1] and tags[1][1] == "p" and tags[1][2] == ev['pubkey']) then
                                 log.error('Failed to delete event')
                                 ws:send(cjson.encode({'OK', ev['id'], false, 'Failed  to delete event'}))
@@ -749,9 +751,9 @@ local function handle_websocket(ws, client_ip, relay_url)
                             exec_params([[
                                 DELETE FROM event WHERE id = $1
                             ]], tag[2])
-                        else
-                            local stored_tags = cjson.decode(res[1].tags)
-                            if res[1].pubkey == ev['pubkey'] or delegated_by({tags = stored_tags}, ev['pubkey']) then
+                        elseif row then
+                            local stored_tags = cjson.decode(row.tags)
+                            if row.pubkey == ev['pubkey'] or delegated_by({tags = stored_tags}, ev['pubkey']) then
                                 exec_params([[
                                     DELETE FROM event WHERE id = $1
                                 ]], tag[2])
