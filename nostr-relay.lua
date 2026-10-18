@@ -13,23 +13,68 @@ log.usecolor = false
 -- Load secrets from environment variables
 local database_url = os.getenv('DATABASE_URL') or error('Environment variable DATABASE_URL is required')
 
--- Connect to PostgreSQL
+-- Connect to PostgreSQL. pgsql.connectdb returns a connection object even
+-- when connecting fails, so the status has to be checked explicitly.
+local function connect()
+    local c = pgsql.connectdb(database_url)
+    if c and c:status() == pgsql.CONNECTION_OK then
+        return c
+    end
+    log.warn(string.format('Failed to connect to PostgreSQL: %s', c and c:errorMessage() or 'unknown error'))
+    return nil
+end
+
+-- PostgreSQL may still be starting up, so wait for it with a backoff.
 log.info('Connecting to PostgreSQL...')
-local con = assert(pgsql.connectdb(database_url))
+local con = connect()
+local delay = 1
+while not con do
+    socket.sleep(delay)
+    delay = math.min(delay * 2, 30)
+    con = connect()
+end
 log.info('PostgreSQL connected.')
 
--- Ensure connection is active, reconnect if needed
+-- Ensure connection is active, reconnect if needed. Returns false when the
+-- database is unreachable so the caller can report the error to the client.
 local function ensure_connection()
-    if not con or con:status() ~= pgsql.CONNECTION_OK then
-        log.warn('Reconnecting to PostgreSQL...')
-        con = assert(pgsql.connectdb(database_url))
-        log.info('PostgreSQL reconnected.')
+    if con and con:status() == pgsql.CONNECTION_OK then
+        return true
+    end
+    log.warn('Reconnecting to PostgreSQL...')
+    con = connect()
+    if not con then
+        return false
+    end
+    log.info('PostgreSQL reconnected.')
+    return true
+end
+
+-- Run a parameterized statement and return its result only if it succeeded,
+-- otherwise nil and an error message. libpq only notices a dropped connection
+-- (e.g. a PostgreSQL restart) when a query fails on it, so such a query is
+-- retried once on a fresh connection.
+local function exec_params(sql, ...)
+    for attempt = 1, 2 do
+        if not ensure_connection() then
+            return nil, 'no connection to the database'
+        end
+        local res = con:execParams(sql, ...)
+        local status = res and res:status()
+        if status == pgsql.PGRES_TUPLES_OK or status == pgsql.PGRES_COMMAND_OK then
+            return res
+        end
+        local errmsg = res and res:errorMessage() or con:errorMessage()
+        if attempt == 2 or con:status() == pgsql.CONNECTION_OK then
+            return nil, errmsg
+        end
+        log.warn(string.format('Lost connection to PostgreSQL: %s', errmsg or 'unknown error'))
     end
 end
 
 -- Prepare schema
 log.info('Preparing database schema...')
-con:exec([[
+local schema = con:exec([[
 CREATE OR REPLACE FUNCTION tags_to_tagvalues(jsonb) RETURNS text[]
     AS 'SELECT array_agg(t->>1) FROM (SELECT jsonb_array_elements($1) AS t)s WHERE length(t->>0) = 1;'
     LANGUAGE SQL
@@ -61,6 +106,9 @@ CREATE INDEX IF NOT EXISTS arbitrarytagvalues ON event USING gin (tagvalues);
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE INDEX IF NOT EXISTS contenttrgmidx ON event USING gin (content gin_trgm_ops);
 ]])
+if not schema or schema:status() ~= pgsql.PGRES_COMMAND_OK then
+    error('Failed to prepare database schema: ' .. (schema and schema:errorMessage() or con:errorMessage() or 'unknown error'))
+end
 log.info('Database schema prepared.')
 
 ----------------------------------------------------------------
@@ -502,12 +550,12 @@ local function handle_replaceable_event(event)
     end
 
     if is_replaceable(kind) then
-        con:execParams([[
+        exec_params([[
             DELETE FROM event WHERE pubkey = $1 AND kind = $2 AND created_at < $3
         ]], event['pubkey'], event['kind'], event['created_at'])
     elseif is_parameterized_replaceable(kind) then
         local d_tag = get_d_tag(event['tags'])
-        con:execParams([[
+        exec_params([[
             DELETE FROM event WHERE pubkey = $1 AND kind = $2 AND $3 = ANY(tagvalues) AND created_at < $4
         ]], event['pubkey'], event['kind'], d_tag, event['created_at'])
     end
@@ -683,7 +731,7 @@ local function handle_websocket(ws, client_ip, relay_url)
                 -- Handle deletion event (kind 5)
                 for _, tag in ipairs(ev['tags']) do
                     if tag[1] == 'e' and tag[2] then
-                        local res = con:execParams([[
+                        local res = exec_params([[
                             SELECT kind, pubkey, tags FROM event WHERE id = $1
                         ]], tag[2])
                         if not res then
@@ -698,13 +746,13 @@ local function handle_websocket(ws, client_ip, relay_url)
                                 ws:send(cjson.encode({'OK', ev['id'], false, 'Failed  to delete event'}))
                                 goto continue
                             end
-                            con:execParams([[
+                            exec_params([[
                                 DELETE FROM event WHERE id = $1
                             ]], tag[2])
                         else
                             local stored_tags = cjson.decode(res[1].tags)
                             if res[1].pubkey == ev['pubkey'] or delegated_by({tags = stored_tags}, ev['pubkey']) then
-                                con:execParams([[
+                                exec_params([[
                                     DELETE FROM event WHERE id = $1
                                 ]], tag[2])
                             end
@@ -715,10 +763,9 @@ local function handle_websocket(ws, client_ip, relay_url)
 
             local skip_storage = handle_replaceable_event(ev)
 
-            ensure_connection()
             local result = true
             if not skip_storage then
-                result = con:execParams([[
+                result = exec_params([[
                     INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig)
                     VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7)
                     ON CONFLICT (id) DO NOTHING
@@ -754,14 +801,12 @@ local function handle_websocket(ws, client_ip, relay_url)
 
             -- NIP-01: the filters are OR'd and each limit applies to its own
             -- filter, so query them one by one and merge the results.
-            ensure_connection()
             local seen = {}
             local events = {}
             for _, filter in ipairs(filters) do
                 local sql, params = build_filter_query(filter, false, client_auth[ws])
-                local res = con:execParams(sql, table.unpack(params))
-                if not res or res:status() ~= pgsql.PGRES_TUPLES_OK then
-                    local errmsg = res and res:errorMessage() or con:errorMessage()
+                local res, errmsg = exec_params(sql, table.unpack(params))
+                if not res then
                     log.error(string.format('Failed to query records: %s', errmsg or 'unknown error'))
                     ws:send(cjson.encode({'NOTICE', 'Failed to query records'}))
                     ws:send(cjson.encode({'CLOSED', sub_id, 'Failed to query records'}))
@@ -804,7 +849,6 @@ local function handle_websocket(ws, client_ip, relay_url)
                 goto continue
             end
 
-            ensure_connection()
             for i = 3, #payload do
                 local filter = payload[i]
                 if type(filter) ~= 'table' then
@@ -812,9 +856,8 @@ local function handle_websocket(ws, client_ip, relay_url)
                     goto continue
                 end
                 local sql, params = build_filter_query(filter, true, client_auth[ws])
-                local res = con:execParams(sql, table.unpack(params))
-                if not res or res:status() ~= pgsql.PGRES_TUPLES_OK then
-                    local errmsg = res and res:errorMessage() or con:errorMessage()
+                local res, errmsg = exec_params(sql, table.unpack(params))
+                if not res then
                     log.error(string.format('Failed to count records: %s', errmsg or 'unknown error'))
                     ws:send(cjson.encode({'CLOSED', query_id, 'error: could not count records'}))
                     goto continue
