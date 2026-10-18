@@ -847,6 +847,24 @@ local function handle_websocket(ws, client_ip, relay_url)
                                 ]], tag[2])
                             end
                         end
+                    elseif tag[1] == 'a' and type(tag[2]) == 'string' then
+                        -- NIP-09: an a tag deletes every version of the
+                        -- replaceable/addressable event up to the deletion's
+                        -- created_at, and only the author may delete it.
+                        local a_kind, a_pubkey, a_d = tag[2]:match('^(%d+):(%x+):?(.*)$')
+                        a_kind = tonumber(a_kind)
+                        if a_kind and a_pubkey == ev['pubkey'] then
+                            if is_parameterized_replaceable(a_kind) then
+                                exec_params([[
+                                    DELETE FROM event WHERE kind = $1 AND pubkey = $2 AND created_at <= $3
+                                    AND COALESCE((SELECT t->>1 FROM jsonb_array_elements(tags) t WHERE t->>0 = 'd' LIMIT 1), '') = $4
+                                ]], a_kind, a_pubkey, ev['created_at'], a_d)
+                            elseif is_replaceable(a_kind) then
+                                exec_params([[
+                                    DELETE FROM event WHERE kind = $1 AND pubkey = $2 AND created_at <= $3
+                                ]], a_kind, a_pubkey, ev['created_at'])
+                            end
+                        end
                     end
                 end
             end
