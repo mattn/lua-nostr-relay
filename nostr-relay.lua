@@ -13,6 +13,16 @@ log.usecolor = false
 -- Load secrets from environment variables
 local database_url = os.getenv('DATABASE_URL') or error('Environment variable DATABASE_URL is required')
 
+-- A connection attempt blocks the whole copas loop, so bound it unless the
+-- URL already sets its own connect_timeout.
+if not database_url:find('connect_timeout') then
+    if database_url:find('^postgres') then
+        database_url = database_url .. (database_url:find('?', 1, true) and '&' or '?') .. 'connect_timeout=3'
+    else
+        database_url = database_url .. ' connect_timeout=3'
+    end
+end
+
 -- Connect to PostgreSQL. pgsql.connectdb returns a connection object even
 -- when connecting fails, so the status has to be checked explicitly.
 local function connect()
@@ -37,15 +47,24 @@ log.info('PostgreSQL connected.')
 
 -- Ensure connection is active, reconnect if needed. Returns false when the
 -- database is unreachable so the caller can report the error to the client.
+-- While it is down, reconnecting is attempted at most once every few seconds
+-- so that requests don't each stall the loop on a connection attempt.
+local reconnect_interval = 5
+local last_failed_reconnect = nil
 local function ensure_connection()
     if con and con:status() == pgsql.CONNECTION_OK then
         return true
     end
+    if last_failed_reconnect and socket.gettime() - last_failed_reconnect < reconnect_interval then
+        return false
+    end
     log.warn('Reconnecting to PostgreSQL...')
     con = connect()
     if not con then
+        last_failed_reconnect = socket.gettime()
         return false
     end
+    last_failed_reconnect = nil
     log.info('PostgreSQL reconnected.')
     return true
 end
