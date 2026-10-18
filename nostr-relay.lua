@@ -13,21 +13,37 @@ log.usecolor = false
 -- Load secrets from environment variables
 local database_url = os.getenv('DATABASE_URL') or error('Environment variable DATABASE_URL is required')
 
--- A connection attempt blocks the whole copas loop, so bound it unless the
--- URL already sets its own connect_timeout.
-if not database_url:find('connect_timeout') then
+-- Add a libpq connection parameter unless the URL already sets it.
+local function add_conninfo_param(key, value)
+    if database_url:find(key .. '=', 1, true) then
+        return
+    end
     if database_url:find('^postgres') then
-        database_url = database_url .. (database_url:find('?', 1, true) and '&' or '?') .. 'connect_timeout=3'
+        database_url = database_url .. (database_url:find('?', 1, true) and '&' or '?') .. key .. '=' .. value
     else
-        database_url = database_url .. ' connect_timeout=3'
+        database_url = database_url .. ' ' .. key .. '=' .. value
     end
 end
+
+-- A connection attempt blocks the whole copas loop, so bound it, and let TCP
+-- keepalives detect a peer that went away while a query is waiting.
+add_conninfo_param('connect_timeout', '3')
+add_conninfo_param('keepalives', '1')
+add_conninfo_param('keepalives_idle', '30')
+add_conninfo_param('keepalives_interval', '10')
+add_conninfo_param('keepalives_count', '3')
+
+-- The server aborts statements running longer than this, and the relay gives
+-- up waiting for a reply a little later (e.g. when the server is frozen).
+local statement_timeout = '10s'
+local query_timeout = 15
 
 -- Connect to PostgreSQL. pgsql.connectdb returns a connection object even
 -- when connecting fails, so the status has to be checked explicitly.
 local function connect()
     local c = pgsql.connectdb(database_url)
     if c and c:status() == pgsql.CONNECTION_OK then
+        c:exec("SET statement_timeout = '" .. statement_timeout .. "'")
         return c
     end
     log.warn(string.format('Failed to connect to PostgreSQL: %s', c and c:errorMessage() or 'unknown error'))
@@ -40,7 +56,7 @@ local con = connect()
 local delay = 1
 while not con do
     socket.sleep(delay)
-    delay = math.min(delay * 2, 30)
+    delay = math.min(delay * 2, 5)
     con = connect()
 end
 log.info('PostgreSQL connected.')
@@ -69,16 +85,52 @@ local function ensure_connection()
     return true
 end
 
+-- Send a statement without blocking the copas loop and wait for its result
+-- until the deadline. On timeout the connection is dropped, since it may still
+-- be busy with the statement, and the next call reconnects.
+local function query_with_deadline(deadline, sql, ...)
+    if not con:sendQueryParams(sql, ...) then
+        return nil
+    end
+    local res
+    while true do
+        if not con:consumeInput() then
+            return nil
+        end
+        if not con:isBusy() then
+            local r = con:getResult()
+            if r == nil then
+                return res
+            end
+            res = r
+        elseif socket.gettime() > deadline then
+            con:finish()
+            con = nil
+            return nil, 'query timed out'
+        else
+            copas.sleep(0.01)
+        end
+    end
+end
+
+-- Queries yield to other clients while they wait, so the single connection is
+-- handed to one statement at a time.
+local con_in_use = false
+
 -- Run a parameterized statement and return its result only if it succeeded,
 -- otherwise nil and an error message. libpq only notices a dropped connection
 -- (e.g. a PostgreSQL restart) when a query fails on it, so such a query is
 -- retried once on a fresh connection.
-local function exec_params(sql, ...)
+local function exec_params_locked(deadline, sql, ...)
     for attempt = 1, 2 do
         if not ensure_connection() then
             return nil, 'no connection to the database'
         end
-        local res = con:execParams(sql, ...)
+        local res, timeout_err = query_with_deadline(deadline, sql, ...)
+        if timeout_err then
+            log.warn('Gave up waiting for PostgreSQL, dropping the connection')
+            return nil, timeout_err
+        end
         local status = res and res:status()
         if status == pgsql.PGRES_TUPLES_OK or status == pgsql.PGRES_COMMAND_OK then
             return res
@@ -89,6 +141,23 @@ local function exec_params(sql, ...)
         end
         log.warn(string.format('Lost connection to PostgreSQL: %s', errmsg or 'unknown error'))
     end
+end
+
+local function exec_params(sql, ...)
+    local deadline = socket.gettime() + query_timeout
+    while con_in_use do
+        if socket.gettime() > deadline then
+            return nil, 'database is busy'
+        end
+        copas.sleep(0.01)
+    end
+    con_in_use = true
+    local ok, res, errmsg = pcall(exec_params_locked, deadline, sql, ...)
+    con_in_use = false
+    if not ok then
+        return nil, res
+    end
+    return res, errmsg
 end
 
 -- Prepare schema
