@@ -13,6 +13,9 @@ log.usecolor = false
 -- Load secrets from environment variables
 local database_url = os.getenv('DATABASE_URL') or error('Environment variable DATABASE_URL is required')
 
+-- NIP-13: minimum proof of work (leading zero bits of the event id), 0 disables it.
+local min_pow_difficulty = math.floor(tonumber(os.getenv('MIN_POW_DIFFICULTY') or '') or 0)
+
 -- Add a libpq connection parameter unless the URL already sets it.
 local function add_conninfo_param(key, value)
     if database_url:find(key .. '=', 1, true) then
@@ -535,6 +538,34 @@ local function sha256(msg)
 end
 
 ----------------------------------------------------------------
+-- NIP-13: Proof of work
+----------------------------------------------------------------
+-- Count the leading zero bits of a hex-encoded event id. Uses only
+-- comparisons on nibble values so it works on Lua 5.2 and 5.3+ alike.
+local function count_leading_zero_bits(hex)
+    local count = 0
+    for i = 1, #hex do
+        local nibble = tonumber(hex:sub(i, i), 16)
+        if not nibble then
+            break
+        end
+        if nibble == 0 then
+            count = count + 4
+        else
+            if nibble <= 1 then
+                count = count + 3
+            elseif nibble <= 3 then
+                count = count + 2
+            elseif nibble <= 7 then
+                count = count + 1
+            end
+            break
+        end
+    end
+    return count
+end
+
+----------------------------------------------------------------
 -- NIP-26: Delegated event signing
 ----------------------------------------------------------------
 local function validate_delegation_conditions(event, conditions)
@@ -805,6 +836,17 @@ local function handle_websocket(ws, client_ip, relay_url)
                 goto continue
             end
 
+            -- NIP-13: enforce proof of work when a minimum difficulty is required.
+            if min_pow_difficulty > 0 then
+                local difficulty = count_leading_zero_bits(tostring(ev['id']))
+                if difficulty < min_pow_difficulty then
+                    log.warn(string.format('Rejected event %s with insufficient proof of work (NIP-13)', ev['id']))
+                    ws:send(cjson.encode({'OK', ev['id'], false,
+                        string.format('pow: difficulty %d is less than %d', difficulty, min_pow_difficulty)}))
+                    goto continue
+                end
+            end
+
             -- NIP-70: protected events require authentication as the author.
             for _, tag in ipairs(ev['tags']) do
                 if tag[1] == '-' and not client_auth[ws][ev['pubkey']] then
@@ -1053,7 +1095,10 @@ local function handle_nip11(conn, _)
         pubkey = os.getenv('RELAY_PUBKEY') or '',
         contact = os.getenv('RELAY_CONTACT') or '',
         icon = os.getenv('RELAY_ICON') or '',
-        supported_nips = {1, 4, 9, 11, 17, 26, 40, 42, 45, 50, 59, 66, 70, 78},
+        supported_nips = {1, 4, 9, 11, 13, 17, 26, 40, 42, 45, 50, 59, 66, 70, 78},
+        limitation = {
+            min_pow_difficulty = min_pow_difficulty
+        },
         relay_countries = relay_countries,
         software = 'lua-nostr-relay',
         version = '0.0.1'
