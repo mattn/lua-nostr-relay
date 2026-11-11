@@ -206,14 +206,17 @@ log.info('Database schema prepared.')
 -- JSON encoder
 ----------------------------------------------------------------
 local function to_json(value)
+    -- NIP-01 canonical escaping: only '"', '\\' and control characters
+    -- are escaped; everything else (including '/' and UTF-8) is emitted raw.
+    local escapes = {
+        ['"'] = '\\"', ['\\'] = '\\\\', ['\b'] = '\\b', ['\f'] = '\\f',
+        ['\n'] = '\\n', ['\r'] = '\\r', ['\t'] = '\\t',
+    }
     local function escape_str(s)
-        local result = s:gsub('\\', '\\\\')
-                        :gsub('"', '\\"')
-                        :gsub('\b', '\\b')
-                        :gsub('\f', '\\f')
-                        :gsub('\n', '\\n')
-                        :gsub('\r', '\\r')
-                        :gsub('\t', '\\t')
+        local result = s:gsub('[%c"\\]', function(c)
+            if c == '\127' then return c end
+            return escapes[c] or string.format('\\u%04x', c:byte())
+        end)
         return '"' .. result .. '"'
     end
 
@@ -221,7 +224,14 @@ local function to_json(value)
         local tp = type(t)
         if tp == 'string' then
             return escape_str(t)
-        elseif tp == 'number' or tp == 'boolean' then
+        elseif tp == 'number' then
+            -- Integers must not carry a decimal point or exponent ("1.0" on
+            -- Lua 5.3+ when cjson decodes them as floats, "1e+15" on 5.2).
+            if t == math.floor(t) and math.abs(t) < 2^53 then
+                return string.format('%d', t)
+            end
+            return tostring(t)
+        elseif tp == 'boolean' then
             return tostring(t)
         elseif tp == 'nil' then
             return 'null'
@@ -822,6 +832,17 @@ local function handle_websocket(ws, client_ip, relay_url)
         ------------------------------------------------------------
         if method == 'EVENT' then
             local ev = payload[2]
+            if type(ev) ~= 'table' then
+                goto continue
+            end
+
+            -- NIP-01: the event id must be the sha256 of the serialized event.
+            local serialized_ok, serialized = pcall(to_json, {0, ev['pubkey'], ev['created_at'], ev['kind'], ev['tags'], ev['content']})
+            if not serialized_ok or sha256(serialized) ~= ev['id'] then
+                log.warn(string.format('Rejected event %s: id does not match', tostring(ev['id'])))
+                ws:send(cjson.encode({'OK', ev['id'] or '', false, 'invalid: event id does not match'}))
+                goto continue
+            end
 
             if not schnorr.verify(ev['sig'], ev['id'], ev['pubkey']) then
                 log.error(string.format('Invalid event signature %s', ev['sig']))
