@@ -305,10 +305,20 @@ end
 ----------------------------------------------------------------
 -- SQL builder for REQ filter
 ----------------------------------------------------------------
+-- NIP-40: SQL condition that is true for events whose expiration has
+-- passed. `$%d` is the current unix time. The @> check lets events without
+-- an expiration tag skip the subquery.
+local EXPIRED_SQL = [==[(tags @> '[["expiration"]]' AND EXISTS (SELECT 1 FROM jsonb_array_elements(tags) tag WHERE tag->>0 = 'expiration' AND CASE WHEN tag->>1 ~ '^[0-9]{1,18}$' THEN (tag->>1)::bigint END <= $%d))]==]
+
 local function build_filter_query(filters, count_only, authenticated_pubkeys)
     local where = {}
     local params = {}
     local idx = 1
+
+    -- NIP-40: never return expired events
+    table.insert(where, 'NOT ' .. string.format(EXPIRED_SQL, idx))
+    params[#params+1] = os.time()
+    idx = idx + 1
 
     -- ids
     if filters['ids'] then
@@ -451,6 +461,20 @@ local function get_d_tag(tags)
         end
     end
     return ''
+end
+
+-- NIP-40: the expiration timestamp of an event, or nil when it has none.
+-- Malformed values are ignored.
+local function get_expiration(tags)
+    for _, tag in ipairs(tags or {}) do
+        if type(tag) == 'table' and tag[1] == 'expiration' then
+            if type(tag[2]) == 'string' and tag[2]:match('^%d+$') and #tag[2] <= 18 then
+                return tonumber(tag[2])
+            end
+            return nil
+        end
+    end
+    return nil
 end
 
 ----------------------------------------------------------------
@@ -875,6 +899,14 @@ local function handle_websocket(ws, client_ip, relay_url)
                     ws:send(cjson.encode({'OK', ev['id'], false, 'auth-required: this event may only be published by its author'}))
                     goto continue
                 end
+            end
+
+            -- NIP-40: an event that has already expired is not accepted.
+            local expiration = get_expiration(ev['tags'])
+            if expiration and expiration <= os.time() then
+                log.warn(string.format('Rejected expired event %s (NIP-40)', ev['id']))
+                ws:send(cjson.encode({'OK', ev['id'], false, 'invalid: event has expired'}))
+                goto continue
             end
 
             local kind = tonumber(ev['kind'])
